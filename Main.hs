@@ -15,12 +15,14 @@ import System.IO
 import System.Time
 import System.Directory
 import System.Environment (getArgs)
-import qualified System.Console.ANSI as TTY
+import System.Console.ANSI as TTY
 import Text.Printf
 
 maybeOr msg = maybe (error msg) id
 
 objpathFor hash = concat ["/objects/", take 2 hash, "/", drop 2 hash]
+
+colorPutStrLn color msg = setSGR [SetColor Foreground Dull color] >> putStr msg >> setSGR [] >> putStrLn ""
 
 getBlob gitdir hash = parseBlob <$> Zlib.decompress <$> BL.readFile (gitdir ++ objpathFor hash)
 
@@ -44,6 +46,7 @@ main = do
     argv <- getArgs
     curdir <- getCurrentDirectory
     outtty <- hIsTerminalDevice stdout
+    let colPutStrLn color = if outtty then colorPutStrLn color else putStrLn
 
     -- search for a .git directory:
     let cpath = filter (/= "/") $ L.groupBy (\a b -> a /= '/' && b /= '/') curdir
@@ -68,7 +71,7 @@ main = do
                 ("commit", _, blob) <- getBlob gitdir commit
                 let (commMeta, commMsg) = break null $ lines $ BLU.toString blob
                 let (cmTZ : cmEpoch : cmAuthor) = reverse $ maybeOr "No commit author" $ commitHeader "author" commMeta
-                putStrLn $ "commit " ++ commit
+                colPutStrLn Yellow $ "commit " ++ commit
                 putStrLn $ "Author:\t" ++ unwords (drop 1 . reverse $ cmAuthor)
                 putStrLn $ "Date\t" ++ show (TOD (read cmEpoch) 0)
                 mapM_ (putStrLn . ("    " ++)) commMsg
