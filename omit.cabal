@@ -20,6 +20,7 @@ executable omit
   -- other-modules:       
   -- other-extensions:    
   build-depends:       base >=4.6 && <4.8, containers, bytestring, utf8-string,
-                       binary, SHA, zlib, directory, unix, ansi-terminal, old-time
+                       binary, SHA, zlib, directory, unix, ansi-terminal, old-time,
+                       Diff
   -- hs-source-dirs:      
   default-language:    Haskell2010
