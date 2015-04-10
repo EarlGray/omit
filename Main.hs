@@ -107,8 +107,6 @@ parseIdxFile_v2 idxfile = do
 
 parseIndex :: BL.ByteString -> [IndexEntry]
 parseIndex dat = map makeIdxentry idxdata
-    -- read extensions
-    -- verify SHA
   where
     ("DIRC", ver, nentries) = runGet (liftM3 (,,) (BU.toString <$> getByteString 4) getWord32be getWord32be) dat
     go nb bs = (B.break (== 0) <$> getByteString nb) >>= (\(d, z) -> (if B.null z then go 8 else return)(B.append bs d))
@@ -117,11 +115,11 @@ parseIndex dat = map makeIdxentry idxdata
     makeIdxentry ([ctsec, ctusec, mtsec, mtusec, stdev, stino, stmode, stuid, stgid, fsize], sha, flags, fname) =
       IndexEntry (TOD (fromIntegral ctsec) (fromIntegral ctusec)) (TOD (fromIntegral mtsec) (fromIntegral mtusec))
                  stdev stino stmode stuid stgid fsize sha flags fname
+    -- read extensions -- verify SHA
 
 groupByAscRange :: [(Int, a)] -> [[a]]
-groupByAscRange = reverse . map reverse . snd . foldr go (0, [[]])
-  where go (k, v) (n, grps) | k == n + 1 = (k, (v : head grps) : tail grps)
-                            | otherwise = (k, if null (head grps) then grps else []:grps)
+groupByAscRange = reverse . map reverse . snd . L.foldl' go (0, [[]])
+  where go (n, grps@(hd:tl)) (k, v) = (k, if k == succ n then ((v : hd) : tl) else [v]:grps)
 
 notFirst diffval = case diffval of { First _ -> False; _ -> True }
 notSecond diffval = case diffval of { Second _ -> False; _ -> True }
@@ -129,12 +127,21 @@ isBoth diffval = case diffval of { Both _ _ -> True; _ -> False }
 
 contextDiff :: Eq t => Int -> [Diff t] -> [[Diff (Int, t)]]
 contextDiff nctx diff = groupByAscRange $ IM.toAscList ctxmap
-  where annot (Both ln1 ln2) (num1, num2, res) = (succ num1, succ num2, Both (num1,ln1) (num2,ln2) : res)
-        annot (First ln)     (num1, num2, res) = (succ num1, num2,      First (num1, ln) : res)
-        annot (Second ln)    (num1, num2, res) = (num1,      succ num2, Second (num2, ln) : res)
-        lnmap = IM.fromList $ zip [1..] $ reverse $ (\(_,_,e) -> e) $ foldr annot (1,1,[]) diff
+  where annot (num1, num2, res) (Both ln1 ln2) = (succ num1, succ num2, Both (num1,ln1) (num2,ln2) : res)
+        annot (num1, num2, res) (First ln)     = (succ num1, num2,      First (num1, ln) : res)
+        annot (num1, num2, res) (Second ln)    = (num1,      succ num2, Second (num2, ln) : res)
+        lnmap = IM.fromList $ zip [1..] $ reverse $ (\(_,_,e) -> e) $ L.foldl' annot (1,1,[]) diff
         isInContext num = not $ all isBoth $ catMaybes [ IM.lookup i lnmap | i <- [(num - nctx)..(num + nctx)] ]
-        ctxmap = IM.foldWithKey (\n dv res -> if isInContext n then IM.insert n dv res else res) IM.empty lnmap
+        ctxmap = IM.foldlWithKey (\res n dv -> if isInContext n then IM.insert n dv res else res) IM.empty lnmap
+
+printCtx [] = []
+printCtx grp@((Both (n1,_) (n2,ln)):grp') =
+    let (len1, len2) = (length $ filter notSecond grp, length $ filter notFirst grp)
+        prettygrp = map (\dv -> case dv of
+                            Both (_,ln) _ -> " " ++ ln
+                            First (_, ln) -> "-" ++ ln
+                            Second (_, ln) -> "+" ++ ln) grp
+    in ((printf "@@ -%d,%d +%d,%d @@ " n1 len1 n2 len2) ++ head prettygrp):(tail prettygrp)
 
 main = do
     argv <- getArgs
@@ -208,18 +215,10 @@ main = do
                       let workdirLines = map BLU.toString $ BLU.lines workdirBlob
                       ("blob", _, stagedBlob) <- getBlob gitdir idxmaps stageSHA
                       let stagedLines = map BLU.toString $ BLU.lines stagedBlob
-                          printCtx [] = []
-                          printCtx grp@((Both (n1,_) (n2,ln)):grp') =
-                              let (len1, len2) = (length $ filter notSecond grp, length $ filter notFirst grp)
-                                  prettygrp = map (\dv -> case dv of
-                                                      Both (_,ln) (_,_) -> " " ++ ln
-                                                      First (_, ln) -> "-" ++ ln
-                                                      Second (_, ln) -> "+" ++ ln) grp
-                              in ((printf "@@ -%d,%d +%d,%d @@ " n1 len1 n2 len2) ++ head prettygrp):(tail prettygrp)
                           diffcap = [ printf "diff --git a/%s b/%s" fname fname,
                                       "index ", printf "--- a/%s\n+++ b/%s" fname fname ]
-                          prettyDiff df = {- diffcap ++ -} (concat $ map printCtx $ contextDiff 4 df)
-                      mapM_ putStrLn $ prettyDiff $ Diff.getDiff workdirLines stagedLines
+                          prettyDiff df = diffcap ++ (concat $ map printCtx $ contextDiff 3 df)
+                      mapM_ putStrLn $ prettyDiff $ Diff.getDiff stagedLines workdirLines
 
           _ -> hPutStrLn stderr $ "Usage: omit diff"
 
