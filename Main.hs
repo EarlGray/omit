@@ -35,12 +35,13 @@ int :: (Num b, Integral a) => a -> b
 int = fromIntegral
 
 bool thenb elseb cond = if cond then thenb else elseb
+on f g x y = f (g x) (g y)
 maybeOr msg = maybe (error msg) id
 splitBy num lst = L.unfoldr (\s -> if null s then Nothing else Just $ splitAt num s) lst
 
 colorPutStrLn color msg = setSGR [SetColor Foreground Dull color] >> putStr msg >> setSGR [] >> putStrLn ""
-todFromPosix etime = TOD sec psec
-  where [(sec, s')] = reads (show etime)
+todFromPosix etime = TOD (read ssec) psec
+  where (ssec, (_:s')) = L.break (not . isDigit) (show etime)
         psec = case reads s' of { [] -> 0; [(nsec, _)] -> 1000 * nsec; }
 
 timespecToTOD (tv_sec, tv_nsec) = TOD (toInteger tv_sec) (1000 * (toInteger tv_nsec))
@@ -50,22 +51,35 @@ type SHAHash = B.ByteString
 showSHA = concatMap (printf "%02x" ) . B.unpack
 readSHA = B.pack . map (fst . head . readHex) . splitBy 2
 
-type HashInfoMap = (M.Map SHAHash (Int, Int, Word32)) -- (packOffset, packSize, crc32)
+hashobj :: BL.ByteString -> SHAHash
+hashobj = BL.toStrict . SHA.bytestringDigest . SHA.sha1
+
+type HashInfoMap = M.Map SHAHash (Int, Int, Word32) -- (packOffset, packSize, crc32)
+type PackIndex = (FilePath, HashInfoMap)
 data IndexEntry = IndexEntry { indCTime::ClockTime, indMTime::ClockTime, indDev::Word32, indIno::Word32,
         indMode::Word32, indUID::Word32, indGID::Word32, indFileSize::Word32, indSHA::SHAHash,
         indFl::Word16, indFName::FilePath } deriving (Show, Eq)
 
+data GitTree = GitBlob SHAHash FilePath | GitTree SHAHash FilePath [GitTree] deriving Show
+
 objpathFor (h1:h2:hash) = concat ["/objects/", (h1:h2:[]), "/", hash]
+
+doesObjExist gitdir idxmaps sha = (any (M.member sha . snd) idxmaps || ) <$> doesFileExist (gitdir ++ objpathFor (showSHA sha))
+
+getHeadRef gitdir = do
+  ("ref", (':':' ':path)) <- (break (== ':') . head . lines) <$> readFile (gitdir ++ "/HEAD")
+  head <$> lines <$> readFile (gitdir </> path)
 
 blobify :: String -> BL.ByteString -> BL.ByteString
 blobify blobty objdata = BL.append (BLU.fromString (blobty ++ " " ++ show (BL.length objdata) ++ "\0")) objdata
 
-getBlob :: FilePath -> [(FilePath, M.Map SHAHash (Int, Int, Word32))] -> String
-           -> IO (String {-type-}, Int {-len-}, BL.ByteString {-blob-})
-getBlob gitdir idxmaps hash = do
-    isobj <- doesFileExist (gitdir ++ objpathFor hash)
-    if isobj then parseBlob <$> Zlib.decompress <$> BL.readFile (gitdir ++ objpathFor hash)
-    else let (idxfile, idxmap) = head $ filter (((readSHA hash) `M.member`) . snd) idxmaps
+writeObject objpath obj = (createDirectoryIfMissing False $ takeDirectory objpath) >> BL.writeFile objpath (Zlib.compress obj)
+
+loadBlob :: FilePath -> [PackIndex] -> SHAHash -> IO (String {-type-}, Int {-len-}, BL.ByteString {-blob-})
+loadBlob gitdir idxmaps hash = do
+    isobj <- doesFileExist (gitdir ++ objpathFor (showSHA hash))
+    if isobj then parseBlob <$> Zlib.decompress <$> BL.readFile (gitdir ++ objpathFor (showSHA hash))
+    else let (idxfile, idxmap) = head $ filter ((hash `M.member`) . snd) idxmaps
              packfile = (gitdir ++ "/objects/pack/" ++ replaceExtension idxfile "pack")
              skipblobinfo (t, n) = getWord8 >>= ((bool (skipblobinfo (t, n+1)) (return (t, n))) . (`testBit` 7))
              blobinfo = getWord8 >>= (\w -> (if w `testBit` 7 then skipblobinfo else return) (w, 1))
@@ -75,25 +89,45 @@ getBlob gitdir idxmaps hash = do
                 zblob <- getByteString (blobsz - skipped)
                 return (ty, BL.fromStrict zblob)
          in do
-             let Just (blobpos, blobsz, _) = M.lookup (readSHA hash) idxmap
+             let Just (blobpos, blobsz, _) = M.lookup hash idxmap
              (ty, zblob) <- runGet (getblob blobpos blobsz) <$> BL.readFile packfile
              let blob = Zlib.decompress zblob
              let Just blobty = L.lookup (ty .&. 0x70) [(0x10,"commit"), (0x20,"tree"), (0x30,"blob")]
              return (blobty, int $ BL.length blob, blob)
 
+writeBlob :: FilePath -> [(FilePath, HashInfoMap)] -> String -> BL.ByteString -> IO SHAHash
+writeBlob gitdir idxmaps blobty blob = do
+  let obj = blobify blobty blob
+  let sha = hashobj obj
+  exists <- doesObjExist gitdir idxmaps sha
+  unless exists $ do 
+    putStrLn $ "### writing : " ++ (gitdir ++ objpathFor (showSHA sha))
+    writeObject (gitdir ++ objpathFor (showSHA sha)) obj
+  return sha
+
 parseBlob :: BL.ByteString -> (String, Int, BL.ByteString) -- blobtype, bloblen, blob
 parseBlob str = let (btype, tl') = BL.break (== 0x20) str ; (slen, tl) = BL.break (== 0) tl'
                 in (BLU.toString btype, read $ BLU.toString slen, BL.tail tl)
 
-parseTreeObject :: BL.ByteString -> [(String, String, String)]
-parseTreeObject = L.unfoldr parseEntry . BL.unpack -- [(mode::String, len::String, path::String)]
+parseTreeObject :: BL.ByteString -> [(String, FilePath, SHAHash)]
+parseTreeObject = L.unfoldr parseEntry . BL.unpack -- [(mode::String, name::FilePath, hash::SHAHash)]
   where parseEntry [] = Nothing
         parseEntry bl = let (hd, (_:tl)) = splitAt (fromJust $ L.findIndex (== 0) bl) bl in
             let (mode, (_:path)) = break (== 0x20) hd ; (hsh, tl') = splitAt 20 tl
-            in Just ((BU.toString $ B.pack mode, BU.toString $ B.pack path, showSHA $ B.pack hsh), tl')
+            in Just ((BU.toString $ B.pack mode, BU.toString $ B.pack path, B.pack hsh), tl')
 
-prettyTreeObject :: [(String, String, String)] -> String
-prettyTreeObject = unlines . map (\(mode, path, hash) -> concat [mode, " blob ", hash, "    ", path])
+dumpTreeObject :: [(String, FilePath, SHAHash)] -> BL.ByteString
+dumpTreeObject = runPut . void . mapM dumpTreeEntry . L.sortBy (compare `on` (\(_,e,_) -> BU.fromString e))
+  where dumpTreeEntry (mod, name, sha) = putByteString (BU.fromString $ mod ++ " " ++ name) >> putWord8 0 >> putByteString sha
+
+prettyTreeObject :: [(String, FilePath, SHAHash)] -> String
+prettyTreeObject = unlines . map (\(mode, path, hash) -> concat [ty mode, " ", showSHA hash, "    ", path])
+  where ty mod = maybeOr ("wrong tree entry type : " ++ mod) $ L.lookup mod blobtypes
+        blobtypes = [("100644","100644 blob"), ("40000","040000 tree")]
+
+parseCommitObject :: BL.ByteString -> (M.Map String String, [String])
+parseCommitObject blob = (M.fromList $ map (\ln -> let (hdr:tl) = words ln in (hdr, unwords tl)) commMeta, commMsg)
+  where (commMeta, commMsg) = break null $ lines $ BLU.toString blob
 
 getIdxFile_v2 :: Get (M.Map SHAHash (Int, Word32))
 getIdxFile_v2 = do
@@ -141,6 +175,30 @@ dumpIndex indmap = BL.append body trailer
           mapM_ putWord32be [int cts, int ctns, int mts, int mtns, dev, ino, mod, uid, gid, fsize]
           putByteString sha >> putWord16be fl >> putByteString bname >> replicateM zpadding (putWord8 0)
 
+loadTree :: FilePath -> [(FilePath, HashInfoMap)] -> SHAHash -> FilePath -> IO GitTree
+loadTree gitdir pathidx hash dirname = do
+  ("tree", _, blob) <- loadBlob gitdir pathidx hash
+  let loadSubtree (mod, name, sha) = case mod of
+        "100644" -> return $ GitBlob sha name
+        "40000" -> loadTree gitdir pathidx sha name
+        _ -> error $ "wrong tree entry type " ++ mod
+  GitTree hash dirname <$> forM (parseTreeObject blob) loadSubtree
+
+writeTree :: FilePath -> [PackIndex] -> GitTree -> IO SHAHash
+writeTree gitdir idxmaps (GitTree sha name entries) = do
+  let mkinfo e = case e of { GitBlob sha name -> ("100644", name, sha); GitTree sha name _ -> ("40000", name, sha) }
+  let treeblob = dumpTreeObject $ map mkinfo entries
+  let obj = blobify "tree" treeblob
+  let sha = hashobj obj
+  exists <- doesObjExist gitdir idxmaps sha
+  unless exists $ do
+    writeObject (gitdir ++ objpathFor (showSHA sha)) obj
+    -- TODO
+  return sha
+
+refreshTree :: FilePath -> M.Map FilePath IndexEntry -> GitTree -> GitTree
+refreshTree workdir indexByPath head@(GitTree sha name entries) = head -- TODO
+
 groupByAscRange :: [(Int, a)] -> [[a]]
 groupByAscRange = reverse . map reverse . snd . L.foldl' go (0, [[]])
   where go (n, grps@(hd:tl)) (k, v) = (k, if k == succ n then ((v : hd) : tl) else [v]:grps)
@@ -178,7 +236,8 @@ main = do
   let gitdir = maybe (error ".git directory not found") snd . listToMaybe . filter fst $ pardirsexist
   let workdir = takeDirectory gitdir
 
-  index <- parseIndex <$> BL.readFile (gitdir ++ "/index")
+  hasindex <- doesFileExist $ gitdir ++ "/index"
+  index <- if hasindex then parseIndex <$> BL.readFile (gitdir ++ "/index") else return []
   let indexByPath = M.fromList $ map (\ie -> (indFName ie, ie)) index
 
   -- find pack files and load them
@@ -189,10 +248,10 @@ main = do
 
   case argv of
     ["cat-file", opt, hash] -> do
-      (blobtype, bloblen, blob) <- getBlob gitdir idxmaps hash
-      putStr $ maybe (error "Usage: omit cat-file [-t|-s|-p] <hash>") id $ lookup opt
+      (blobtype, bloblen, blob) <- loadBlob gitdir idxmaps (readSHA hash)
+      putStr $ maybeOr "Usage: omit cat-file [-t|-s|-p] <hash>" $ lookup opt
         [("-t", blobtype ++ "\n"), ("-s", show bloblen ++ "\n"),
-         ("-p", maybe (error "bad file") id $ lookup blobtype
+         ("-p", maybeOr "bad file" $ lookup blobtype
             [("blob", BLU.toString blob), ("commit", BLU.toString blob),
              ("tree", prettyTreeObject $ parseTreeObject blob)]),
          ("blob", BLU.toString blob), ("tree", prettyTreeObject $ parseTreeObject blob),
@@ -211,23 +270,20 @@ main = do
     ("ls-files":argv') -> mapM_ (putStrLn . indFName) index
 
     ("log":[]) -> do
-      let commitHeader hdr info = words <$> (listToMaybe $ filter (L.isPrefixOf $ hdr ++ " ") info)
       let printCommit commit = do
-              ("commit", _, blob) <- getBlob gitdir idxmaps commit
-              let (commMeta, commMsg) = break null $ lines $ BLU.toString blob
+              ("commit", _, blob) <- loadBlob gitdir idxmaps (readSHA commit)
+              let (commMeta, commMsg) = parseCommitObject blob
               let (cmTZ : cmEpoch : cmAuthor) =
-                      reverse $ maybeOr "No commit author" $ commitHeader "author" commMeta
+                      reverse $ words $ maybeOr "No commit author" $ M.lookup "author" commMeta
               colPutStrLn Yellow $ "commit " ++ commit
               putStrLn $ "Author:\t" ++ unwords (drop 1 . reverse $ cmAuthor)
               putStrLn $ "Date\t" ++ show (TOD (read cmEpoch) 0)
               mapM_ (putStrLn . ("    " ++)) commMsg
               putStrLn ""
-              let cmPar = commitHeader "parent" commMeta
-              when (isJust cmPar) $ let ["parent", parent] = fromJust cmPar in printCommit parent
+              let cmPar = M.lookup "parent" commMeta
+              when (isJust cmPar) $ let Just parent = cmPar in printCommit parent
 
-      ("ref", (':':' ':path)) <- (break (== ':') . head . lines) <$> readFile (gitdir ++ "/HEAD")
-      commit <- head <$> lines <$> readFile (gitdir </> path)
-      printCommit commit
+      getHeadRef gitdir >>= printCommit
 
     ("diff":argv') -> do
       case argv' of
@@ -237,7 +293,7 @@ main = do
                 let fileSHA = show (SHA.sha1 $ blobify "blob" workdirBlob)
                 when (fileSHA /= stageSHA) $ do
                   let workdirLines = map BLU.toString $ BLU.lines workdirBlob
-                  ("blob", _, stagedBlob) <- getBlob gitdir idxmaps stageSHA
+                  ("blob", _, stagedBlob) <- loadBlob gitdir idxmaps (readSHA stageSHA)
                   let stagedLines = map BLU.toString $ BLU.lines stagedBlob
                       diffcap = [ printf "diff --git a/%s b/%s" fname fname,
                           printf "index %s..%s %o" (take lc stageSHA) (take lc fileSHA) (indMode ie),
@@ -252,21 +308,27 @@ main = do
             path <- Dir.canonicalizePath (curdir </> rpath)
             s <- getFileStatus path
             unless (isRegularFile s) $ fail ("not a file : " ++ rpath)
-            blob <- blobify "blob" <$> BL.readFile path
-            let (sha, fname) = (show $ SHA.sha1 blob, makeRelative workdir path)
-                objpath = gitdir ++ objpathFor sha
+            sha <- writeBlob gitdir idxmaps "blob" =<< BL.readFile path
+            let fname = makeRelative workdir path
                 ie = IndexEntry (todFromPosix $ statusChangeTimeHiRes s) (todFromPosix $ modificationTimeHiRes s)
                       (int$deviceID s) (int$fileID s) 0x81a4 (int$fileOwner s) (int$fileGroup s) (int $ fileSize s)
-                      (readSHA sha) (0x7ff .&. int (length fname)) fname
-            exists <- doesFileExist objpath
-            unless (exists || any (M.member (readSHA sha) . snd) idxmaps) $ do
-                createDirectoryIfMissing False $ takeDirectory objpath
-                BL.writeFile objpath (Zlib.compress blob)
+                      sha (0x7ff .&. int (B.length $ BU.fromString fname)) fname
             return $ M.insert fname ie pathidx
 
       pathidx <- foldM iterargv indexByPath argv'
-      BL.writeFile (gitdir </> "omit_index") $ dumpIndex pathidx
-      Dir.renameFile (gitdir </> "index") (workdir </> "git.index")
-      Dir.renameFile (gitdir </> "omit_index") (gitdir </> "index")
+      let (omit_index, indpath, indbackup) = (gitdir </> "omit_index", gitdir </> "index", gitdir </> "index.old")
+      BL.writeFile omit_index $ dumpIndex pathidx
+      doesFileExist indpath >>= (flip when (Dir.renameFile indpath indbackup))
+      Dir.renameFile omit_index indpath
+
+    ("write-tree":argv') -> do
+      let prefix = maybe "" (\i -> argv' !! succ i) $ L.findIndex (`L.elem` ["-p", "--prefix"]) argv'
+      ("commit", _, commitblob) <- loadBlob gitdir idxmaps =<< readSHA <$> getHeadRef gitdir
+      let (commMeta, _) = parseCommitObject commitblob
+      let tree = fromJust $ M.lookup "tree" commMeta
+      --putStrLn $ "tree = " ++ tree
+      headtree <- loadTree gitdir idxmaps (readSHA tree) prefix
+      treesha <- writeTree gitdir idxmaps (refreshTree (workdir ++ "/" ++ prefix) indexByPath headtree)
+      putStrLn $ showSHA treesha
 
     _ -> error "Usage: omit [cat-file|verify-pack|ls-files|log|add|diff]"
