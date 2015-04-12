@@ -22,7 +22,8 @@ import qualified Data.Digest.Pure.SHA as SHA
 import System.IO
 import System.Time
 import System.Directory as Dir
-import System.FilePath.Posix ((</>), takeDirectory, replaceExtension, makeRelative)
+import System.FilePath.Posix ((</>), takeDirectory, replaceExtension)
+import qualified System.FilePath.Posix as FP
 import System.Posix as Posix
 import System.Posix.Types
 import System.Environment (getArgs)
@@ -61,6 +62,7 @@ data IndexEntry = IndexEntry { indCTime::ClockTime, indMTime::ClockTime, indDev:
         indFl::Word16, indFName::FilePath } deriving (Show, Eq)
 
 data GitTree = GitBlob SHAHash FilePath | GitTree SHAHash FilePath [GitTree] deriving Show
+data FSTree = FSDir FilePath [FSTree] | FSFile FilePath deriving Show
 
 objpathFor (h1:h2:hash) = concat ["/objects/", (h1:h2:[]), "/", hash]
 
@@ -185,6 +187,7 @@ loadTree gitdir pathidx hash dirname = do
   GitTree hash dirname <$> forM (parseTreeObject blob) loadSubtree
 
 writeTree :: FilePath -> [PackIndex] -> GitTree -> IO SHAHash
+writeTree _ _ (GitBlob sha _) = return sha   -- a blob must have been written by `omit add` already
 writeTree gitdir idxmaps (GitTree sha name entries) = do
   let mkinfo e = case e of { GitBlob sha name -> ("100644", name, sha); GitTree sha name _ -> ("40000", name, sha) }
   let treeblob = dumpTreeObject $ map mkinfo entries
@@ -192,9 +195,35 @@ writeTree gitdir idxmaps (GitTree sha name entries) = do
   let sha = hashobj obj
   exists <- doesObjExist gitdir idxmaps sha
   unless exists $ do
+    mapM_ (writeTree gitdir idxmaps) entries
     writeObject (gitdir ++ objpathFor (showSHA sha)) obj
-    -- TODO
   return sha
+
+fsTreeFromList :: FilePath -> [[FilePath]] -> FSTree
+fsTreeFromList dir fileparts = FSDir dir dirlst
+  where grps' = L.groupBy ((==) `on` head) fileparts
+        grps = map (\grp -> (head (head grp), map tail grp)) grps'
+        dirlst = map (\(fname, subdirs) -> if null (head subdirs) then FSFile fname else (fsTreeFromList (FP.dropTrailingPathSeparator fname) subdirs)) grps
+
+makeTreeFromIndex :: FilePath -> M.Map FilePath IndexEntry -> IO GitTree
+makeTreeFromIndex root indexByPath = go root $ fsTreeFromList root $ map (FP.splitPath . indFName . snd) $ M.toAscList indexByPath
+  where
+    go workdir (FSDir dir entries) = do
+      leaves <- forM entries $ \entry -> do
+        case entry of
+          FSFile fname -> do
+            let path' = FP.makeRelative root workdir </> fname
+                path = if "./" `L.isPrefixOf` path' then drop 2 path' else path'
+            let sha = indSHA $ fromJust $ M.lookup path indexByPath
+            putStrLn $ "### path : " ++ path
+            putStrLn $ "### blob " ++ showSHA sha ++ " : " ++ (workdir </> fname)
+            return $ GitBlob sha fname
+          FSDir subdir _ -> go (workdir </> subdir) entry >>= (\d -> print d >> return d)
+      let treeentrify (GitBlob sha fname) = ("100644", fname, sha)
+          treeentrify (GitTree sha dir _) = ("40000",  dir, sha)
+      mapM (\(mod, name, sha) -> putStrLn $ mod++" "++showSHA sha++": " ++name) $ map treeentrify leaves
+      let sha = hashobj $ blobify "tree" $ dumpTreeObject $ map treeentrify leaves
+      return $ GitTree sha dir leaves
 
 refreshTree :: FilePath -> M.Map FilePath IndexEntry -> GitTree -> GitTree
 refreshTree workdir indexByPath head@(GitTree sha name entries) = head -- TODO
@@ -309,7 +338,7 @@ main = do
             s <- getFileStatus path
             unless (isRegularFile s) $ fail ("not a file : " ++ rpath)
             sha <- writeBlob gitdir idxmaps "blob" =<< BL.readFile path
-            let fname = makeRelative workdir path
+            let fname = FP.makeRelative workdir path
                 ie = IndexEntry (todFromPosix $ statusChangeTimeHiRes s) (todFromPosix $ modificationTimeHiRes s)
                       (int$deviceID s) (int$fileID s) 0x81a4 (int$fileOwner s) (int$fileGroup s) (int $ fileSize s)
                       sha (0x7ff .&. int (B.length $ BU.fromString fname)) fname
@@ -323,12 +352,8 @@ main = do
 
     ("write-tree":argv') -> do
       let prefix = maybe "" (\i -> argv' !! succ i) $ L.findIndex (`L.elem` ["-p", "--prefix"]) argv'
-      ("commit", _, commitblob) <- loadBlob gitdir idxmaps =<< readSHA <$> getHeadRef gitdir
-      let (commMeta, _) = parseCommitObject commitblob
-      let tree = fromJust $ M.lookup "tree" commMeta
-      --putStrLn $ "tree = " ++ tree
-      headtree <- loadTree gitdir idxmaps (readSHA tree) prefix
-      treesha <- writeTree gitdir idxmaps (refreshTree (workdir ++ "/" ++ prefix) indexByPath headtree)
+      indtree <- makeTreeFromIndex workdir indexByPath
+      treesha <- writeTree gitdir idxmaps indtree
       putStrLn $ showSHA treesha
 
     _ -> error "Usage: omit [cat-file|verify-pack|ls-files|log|add|diff]"
