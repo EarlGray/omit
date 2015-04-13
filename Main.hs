@@ -26,7 +26,8 @@ import System.FilePath.Posix ((</>), takeDirectory, replaceExtension)
 import qualified System.FilePath.Posix as FP
 import System.Posix as Posix
 import System.Posix.Types
-import System.Environment (getArgs)
+import System.Process as Proc
+import System.Environment (getArgs, lookupEnv)
 import System.Console.ANSI as TTY
 import System.Exit (exitFailure, exitSuccess)
 import Numeric (readHex)
@@ -70,7 +71,13 @@ doesObjExist gitdir idxmaps sha = (any (M.member sha . snd) idxmaps || ) <$> doe
 
 getHeadRef gitdir = do
   ("ref", (':':' ':path)) <- (break (== ':') . head . lines) <$> readFile (gitdir ++ "/HEAD")
-  head <$> lines <$> readFile (gitdir </> path)
+  return $ path
+getHeadSHA gitdir = do
+  reffile <- (gitdir </>) <$> getHeadRef gitdir
+  head <$> lines <$> readFile reffile
+getHeadTree gitdir idxmaps = do
+  ("commit", _, blob) <- loadBlob gitdir idxmaps =<< (readSHA <$> getHeadSHA gitdir)
+  return $ fromJust $ M.lookup "tree" $ fst $ parseCommitObject blob
 
 blobify :: String -> BL.ByteString -> BL.ByteString
 blobify blobty objdata = BL.append (BLU.fromString (blobty ++ " " ++ show (BL.length objdata) ++ "\0")) objdata
@@ -199,6 +206,13 @@ writeTree gitdir idxmaps (GitTree sha name entries) = do
     writeObject (gitdir ++ objpathFor (showSHA sha)) obj
   return sha
 
+commitTree :: FilePath -> [(String, String)] -> String -> IO SHAHash
+commitTree gitdir meta msg = do
+  let obj = blobify "commit" $ BLU.fromString $ unlines ((map (\(hdr, inf) -> unwords [hdr, inf]) meta) ++ [""] ++ lines msg)
+  let sha = hashobj obj
+  writeObject (gitdir ++ objpathFor (showSHA sha)) obj
+  return sha
+
 fsTreeFromList :: FilePath -> [[FilePath]] -> FSTree
 fsTreeFromList dir fileparts = FSDir dir dirlst
   where grps' = L.groupBy ((==) `on` head) fileparts
@@ -214,14 +228,11 @@ makeTreeFromIndex root indexByPath = go root $ fsTreeFromList root $ map (FP.spl
           FSFile fname -> do
             let path' = FP.makeRelative root workdir </> fname
                 path = if "./" `L.isPrefixOf` path' then drop 2 path' else path'
-            let sha = indSHA $ fromJust $ M.lookup path indexByPath
-            putStrLn $ "### path : " ++ path
-            putStrLn $ "### blob " ++ showSHA sha ++ " : " ++ (workdir </> fname)
-            return $ GitBlob sha fname
-          FSDir subdir _ -> go (workdir </> subdir) entry >>= (\d -> print d >> return d)
+            return $ GitBlob (indSHA $ fromJust $ M.lookup path indexByPath) fname
+          FSDir subdir _ -> go (workdir </> subdir) entry
       let treeentrify (GitBlob sha fname) = ("100644", fname, sha)
           treeentrify (GitTree sha dir _) = ("40000",  dir, sha)
-      mapM (\(mod, name, sha) -> putStrLn $ mod++" "++showSHA sha++": " ++name) $ map treeentrify leaves
+      -- mapM (\(mod, name, sha) -> putStrLn $ mod++" "++showSHA sha++": " ++name) $ map treeentrify leaves
       let sha = hashobj $ blobify "tree" $ dumpTreeObject $ map treeentrify leaves
       return $ GitTree sha dir leaves
 
@@ -312,7 +323,7 @@ main = do
               let cmPar = M.lookup "parent" commMeta
               when (isJust cmPar) $ let Just parent = cmPar in printCommit parent
 
-      getHeadRef gitdir >>= printCommit
+      getHeadSHA gitdir >>= printCommit
 
     ("diff":argv') -> do
       case argv' of
@@ -351,9 +362,31 @@ main = do
       Dir.renameFile omit_index indpath
 
     ("write-tree":argv') -> do
-      let prefix = maybe "" (\i -> argv' !! succ i) $ L.findIndex (`L.elem` ["-p", "--prefix"]) argv'
-      indtree <- makeTreeFromIndex workdir indexByPath
-      treesha <- writeTree gitdir idxmaps indtree
+      treesha <- writeTree gitdir idxmaps =<< makeTreeFromIndex workdir indexByPath
       putStrLn $ showSHA treesha
 
-    _ -> error "Usage: omit [cat-file|verify-pack|ls-files|log|add|diff]"
+    ("commit":argv') -> do
+      (prevcommit, reffile) <- (,) <$> getHeadSHA gitdir <*> getHeadRef gitdir
+      prevtree <- getHeadTree gitdir idxmaps
+
+      -- read .git/config or ~/.gitconfig, lookup user.name and user.email
+      TOD epoch _ <- getClockTime
+      let cmAuthor = "Dmytro S. <dmytrish@gmail.com> " ++ show epoch ++ " +0300"
+
+      editor <- maybe "vi" id <$> lookupEnv "EDITOR"
+      Proc.runCommand (editor ++ " " ++ (gitdir </> "COMMIT_EDITMSG")) >>= Proc.waitForProcess
+
+      editmsg <- readFile (gitdir </> "COMMIT_EDITMSG")
+      let commMsg = unlines $ filter (not.null) $ map (takeWhile (/= '#')) $ lines editmsg
+      when (null commMsg) $ error "no commit message"
+
+      treesha <- writeTree gitdir idxmaps =<< makeTreeFromIndex workdir indexByPath
+      let commMeta = [("tree", showSHA treesha), ("parent", prevcommit), ("author", cmAuthor), ("committer", cmAuthor)]
+      when (treesha == readSHA prevtree) $ fail "no changes to commit"
+
+      commit <- showSHA <$> commitTree gitdir commMeta commMsg
+      writeFile (gitdir </> "omit_ref") commit
+      Dir.renameFile (gitdir </> "omit_ref") (gitdir </> reffile)
+      putStrLn commit
+
+    _ -> error "Usage: omit [cat-file|verify-pack|ls-files|log|diff|add|commit]"
