@@ -236,9 +236,6 @@ makeTreeFromIndex root indexByPath = go root $ fsTreeFromList root $ map (FP.spl
       let sha = hashobj $ blobify "tree" $ dumpTreeObject $ map treeentrify leaves
       return $ GitTree sha dir leaves
 
-refreshTree :: FilePath -> M.Map FilePath IndexEntry -> GitTree -> GitTree
-refreshTree workdir indexByPath head@(GitTree sha name entries) = head -- TODO
-
 groupByAscRange :: [(Int, a)] -> [[a]]
 groupByAscRange = reverse . map reverse . snd . L.foldl' go (0, [[]])
   where go (n, grps@(hd:tl)) (k, v) = (k, if k == succ n then ((v : hd) : tl) else [v]:grps)
