@@ -282,8 +282,7 @@ lookupConfigs key = listToMaybe . catMaybes . map (L.lookup key)
 main = do
   argv <- getArgs
   curdir <- getCurrentDirectory
-  let outtty = True
-  -- outtty <- hIsTerminalDevice stdout
+  outtty <- hIsTerminalDevice stdout
   let colPutStrLn color = if outtty then colorPutStrLn color else putStrLn
 
   -- search for a .git directory:
@@ -361,8 +360,10 @@ main = do
                       diffcap = [ printf "diff --git a/%s b/%s" fname fname,
                           printf "index %s..%s %o" (take lc stageSHA) (take lc fileSHA) (indMode ie),
                           printf "--- a/%s\n+++ b/%s" fname fname ]
-                      prettyDiff df = diffcap ++ (concat $ map printCtx $ contextDiff 3 df)
-                  mapM_ putStrLn $ prettyDiff $ Diff.getDiff stagedLines workdirLines
+                      prettyDiff = concat . map printCtx . contextDiff 3
+                      colDiffprint ln@(c:_) = (maybe putStrLn colPutStrLn $ L.lookup c [('+',Green), ('-',Red), ('@',Cyan)]) ln
+                  mapM_ putStrLn diffcap
+                  mapM_ colDiffprint $ prettyDiff $ Diff.getDiff stagedLines workdirLines
 
         _ -> hPutStrLn stderr $ "Usage: omit diff"
 
