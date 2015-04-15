@@ -22,10 +22,9 @@ import qualified Data.Digest.Pure.SHA as SHA
 import System.IO
 import System.Time
 import System.Directory as Dir
-import System.FilePath.Posix ((</>), takeDirectory, replaceExtension)
-import qualified System.FilePath.Posix as FP
 import System.Posix as Posix
-import System.Posix.Types
+import System.FilePath.Posix ((</>))
+import qualified System.FilePath.Posix as PF
 import System.Process as Proc
 import System.Environment (getArgs, lookupEnv)
 import System.Console.ANSI as TTY
@@ -62,7 +61,12 @@ data IndexEntry = IndexEntry { indCTime::ClockTime, indMTime::ClockTime, indDev:
         indMode::Word32, indUID::Word32, indGID::Word32, indFileSize::Word32, indSHA::SHAHash,
         indFl::Word16, indFName::FilePath } deriving (Show, Eq)
 
-data GitTree = GitBlob SHAHash FilePath | GitTree SHAHash FilePath [GitTree] deriving Show
+data BlobMode = FileBlob | ExecBlob | SymlinkBlob | GitlinkBlob | UnknownBlob String
+instance Show BlobMode where
+  show mod = case mod of { FileBlob->"100644"; ExecBlob->"100755"; SymlinkBlob->"120000"; GitlinkBlob->"160000"; UnknownBlob mod -> mod }
+indmodeToBlobMode = flip L.lookup [(0o100644,FileBlob),(0o100755,ExecBlob),(0o120000,SymlinkBlob),(0o160000,GitlinkBlob)]
+
+data GitTree = GitBlob BlobMode SHAHash FilePath | GitTree SHAHash FilePath [GitTree] deriving Show
 data FSTree = FSDir FilePath [FSTree] | FSFile FilePath deriving Show
 
 objpathFor (h1:h2:hash) = concat ["/objects/", (h1:h2:[]), "/", hash]
@@ -82,14 +86,14 @@ getHeadTree gitdir idxmaps = do
 blobify :: String -> BL.ByteString -> BL.ByteString
 blobify blobty objdata = BL.append (BLU.fromString (blobty ++ " " ++ show (BL.length objdata) ++ "\0")) objdata
 
-writeObject objpath obj = (createDirectoryIfMissing False $ takeDirectory objpath) >> BL.writeFile objpath (Zlib.compress obj)
+writeObject objpath obj = (createDirectoryIfMissing False $ PF.takeDirectory objpath) >> BL.writeFile objpath (Zlib.compress obj)
 
 loadBlob :: FilePath -> [PackIndex] -> SHAHash -> IO (String {-type-}, Int {-len-}, BL.ByteString {-blob-})
 loadBlob gitdir idxmaps hash = do
     isobj <- doesFileExist (gitdir ++ objpathFor (showSHA hash))
     if isobj then parseBlob <$> Zlib.decompress <$> BL.readFile (gitdir ++ objpathFor (showSHA hash))
     else let (idxfile, idxmap) = head $ filter ((hash `M.member`) . snd) idxmaps
-             packfile = (gitdir ++ "/objects/pack/" ++ replaceExtension idxfile "pack")
+             packfile = (gitdir ++ "/objects/pack/" ++ PF.replaceExtension idxfile "pack")
              skipblobinfo (t, n) = getWord8 >>= ((bool (skipblobinfo (t, n+1)) (return (t, n))) . (`testBit` 7))
              blobinfo = getWord8 >>= (\w -> (if w `testBit` 7 then skipblobinfo else return) (w, 1))
              getblob blobpos blobsz = do
@@ -109,7 +113,7 @@ writeBlob gitdir idxmaps blobty blob = do
   let obj = blobify blobty blob
   let sha = hashobj obj
   exists <- doesObjExist gitdir idxmaps sha
-  unless exists $ do 
+  unless exists $ do
     putStrLn $ "### writing : " ++ (gitdir ++ objpathFor (showSHA sha))
     writeObject (gitdir ++ objpathFor (showSHA sha)) obj
   return sha
@@ -151,7 +155,7 @@ getIdxFile_v2 = do
 parseIdxFile_v2 :: FilePath -> IO HashInfoMap -- (offset, size, crc32)
 parseIdxFile_v2 idxfile = do
     idxdata <- BL.readFile idxfile
-    packlen <- int <$> fileSize <$> getFileStatus (replaceExtension idxfile "pack")
+    packlen <- int <$> fileSize <$> getFileStatus (PF.replaceExtension idxfile "pack")
     let (idxbody, trail) = BL.splitAt (BL.length idxdata - 20) idxdata
     when ((show $ SHA.sha1 idxbody) /= (showSHA $ BL.toStrict trail)) $ error "idxfile: idx hash invalid"
     let (0xff744f63, 2, idxmap') = runGet (liftM3 (,,) getWord32be getWord32be getIdxFile_v2) idxbody
@@ -187,16 +191,16 @@ dumpIndex indmap = BL.append body trailer
 loadTree :: FilePath -> [(FilePath, HashInfoMap)] -> SHAHash -> FilePath -> IO GitTree
 loadTree gitdir pathidx hash dirname = do
   ("tree", _, blob) <- loadBlob gitdir pathidx hash
-  let loadSubtree (mod, name, sha) = case mod of
-        "100644" -> return $ GitBlob sha name
-        "40000" -> loadTree gitdir pathidx sha name
-        _ -> error $ "wrong tree entry type " ++ mod
+  let loadSubtree (mod, name, sha) = if mod == "40000" || mod == "040000"
+        then loadTree gitdir pathidx sha name
+        else return $ GitBlob (maybe (UnknownBlob mod) id $ lookup mod
+              [("100644",FileBlob), ("100755",ExecBlob), ("120000",SymlinkBlob), ("160000",GitlinkBlob)]) sha name
   GitTree hash dirname <$> forM (parseTreeObject blob) loadSubtree
 
 writeTree :: FilePath -> [PackIndex] -> GitTree -> IO SHAHash
-writeTree _ _ (GitBlob sha _) = return sha   -- a blob must have been written by `omit add` already
+writeTree _ _ (GitBlob _ sha _) = return sha   -- a blob must have been written by `omit add` already
 writeTree gitdir idxmaps (GitTree sha name entries) = do
-  let mkinfo e = case e of { GitBlob sha name -> ("100644", name, sha); GitTree sha name _ -> ("40000", name, sha) }
+  let mkinfo e = case e of { GitBlob mod sha name -> (show mod, name, sha); GitTree sha name _ -> ("40000", name, sha) }
   let treeblob = dumpTreeObject $ map mkinfo entries
   let obj = blobify "tree" treeblob
   let sha = hashobj obj
@@ -217,20 +221,23 @@ fsTreeFromList :: FilePath -> [[FilePath]] -> FSTree
 fsTreeFromList dir fileparts = FSDir dir dirlst
   where grps' = L.groupBy ((==) `on` head) fileparts
         grps = map (\grp -> (head (head grp), map tail grp)) grps'
-        dirlst = map (\(fname, subdirs) -> if null (head subdirs) then FSFile fname else (fsTreeFromList (FP.dropTrailingPathSeparator fname) subdirs)) grps
+        dirlst = map (\(fname, subdirs) -> if null (head subdirs) then FSFile fname else (fsTreeFromList (PF.dropTrailingPathSeparator fname) subdirs)) grps
 
 makeTreeFromIndex :: FilePath -> M.Map FilePath IndexEntry -> IO GitTree
-makeTreeFromIndex root indexByPath = go root $ fsTreeFromList root $ map (FP.splitPath . indFName . snd) $ M.toAscList indexByPath
+makeTreeFromIndex root indexByPath = go root $ fsTreeFromList root $ map (PF.splitPath . indFName . snd) $ M.toAscList indexByPath
   where
     go workdir (FSDir dir entries) = do
       leaves <- forM entries $ \entry -> do
         case entry of
           FSFile fname -> do
-            let path' = FP.makeRelative root workdir </> fname
+            let ie = fromJust $ M.lookup path indexByPath
+                path' = PF.makeRelative root workdir </> fname
                 path = if "./" `L.isPrefixOf` path' then drop 2 path' else path'
-            return $ GitBlob (indSHA $ fromJust $ M.lookup path indexByPath) fname
+            case indmodeToBlobMode (indMode ie)  of
+              Nothing  -> error $ concat ["unknown mode ", show (indMode ie), " in index ", showSHA (indSHA ie)]
+              Just mod -> return $ GitBlob mod (indSHA ie) fname
           FSDir subdir _ -> go (workdir </> subdir) entry
-      let treeentrify (GitBlob sha fname) = ("100644", fname, sha)
+      let treeentrify (GitBlob mod sha fname) = (show mod, fname, sha)
           treeentrify (GitTree sha dir _) = ("40000",  dir, sha)
       -- mapM (\(mod, name, sha) -> putStrLn $ mod++" "++showSHA sha++": " ++name) $ map treeentrify leaves
       let sha = hashobj $ blobify "tree" $ dumpTreeObject $ map treeentrify leaves
@@ -271,7 +278,7 @@ main = do
   let parents = map ((\d -> "/"++d++"/.git") . L.intercalate "/") . takeWhile (not.null) . iterate init $ cpath
   pardirsexist <- mapM (\d -> (,d) <$> doesDirectoryExist d) parents
   let gitdir = maybe (error ".git directory not found") snd . listToMaybe . filter fst $ pardirsexist
-  let workdir = takeDirectory gitdir
+  let workdir = PF.takeDirectory gitdir
 
   hasindex <- doesFileExist $ gitdir ++ "/index"
   index <- if hasindex then parseIndex <$> BL.readFile (gitdir ++ "/index") else return []
@@ -297,7 +304,7 @@ main = do
     ("verify-pack":argv') -> do
       let (verbose, packfile) = ("-v" `elem` argv', last argv')
       let verifyPack = do
-              offmap <- parseIdxFile_v2 $ replaceExtension packfile "idx"
+              offmap <- parseIdxFile_v2 $ PF.replaceExtension packfile "idx"
               let printHash (hsh, (off, sz, crc32)) =
                       putStrLn $ L.intercalate " " [showSHA hsh, show sz, show off]
               when verbose $ forM_ (M.toList offmap) printHash
@@ -344,11 +351,14 @@ main = do
       let iterargv pathidx rpath = do
             path <- Dir.canonicalizePath (curdir </> rpath)
             s <- getFileStatus path
-            unless (isRegularFile s) $ fail ("not a file : " ++ rpath)
-            sha <- writeBlob gitdir idxmaps "blob" =<< BL.readFile path
-            let fname = FP.makeRelative workdir path
+            (blob, mod) <- case s of
+              _ | isRegularFile s  -> (, bool 0o100755 0o100644 (fileMode s `testBit` 6)) <$> BL.readFile path
+              _ | isSymbolicLink s -> (, 0o120000) <$> BLU.fromString <$> Posix.readSymbolicLink path
+              _ -> error ("not a valid file to add: " ++ rpath)
+            sha <- writeBlob gitdir idxmaps "blob" blob
+            let fname = PF.makeRelative workdir path
                 ie = IndexEntry (todFromPosix $ statusChangeTimeHiRes s) (todFromPosix $ modificationTimeHiRes s)
-                      (int$deviceID s) (int$fileID s) 0x81a4 (int$fileOwner s) (int$fileGroup s) (int $ fileSize s)
+                      (int$deviceID s) (int$fileID s) mod (int$fileOwner s) (int$fileGroup s) (int $ fileSize s)
                       sha (0x7ff .&. int (B.length $ BU.fromString fname)) fname
             return $ M.insert fname ie pathidx
 
