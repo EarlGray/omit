@@ -21,6 +21,7 @@ import Codec.Compression.Zlib as Zlib
 import qualified Data.Digest.Pure.SHA as SHA
 import System.IO
 import System.Time
+import Data.Time.LocalTime
 import System.Directory as Dir
 import System.Posix as Posix
 import System.FilePath.Posix ((</>))
@@ -193,7 +194,7 @@ loadTree gitdir pathidx hash dirname = do
   ("tree", _, blob) <- loadBlob gitdir pathidx hash
   let loadSubtree (mod, name, sha) = if mod == "40000" || mod == "040000"
         then loadTree gitdir pathidx sha name
-        else return $ GitBlob (maybe (UnknownBlob mod) id $ lookup mod
+        else return $ GitBlob (fromMaybe (UnknownBlob mod) $ lookup mod
               [("100644",FileBlob), ("100755",ExecBlob), ("120000",SymlinkBlob), ("160000",GitlinkBlob)]) sha name
   GitTree hash dirname <$> forM (parseTreeObject blob) loadSubtree
 
@@ -230,7 +231,7 @@ makeTreeFromIndex root indexByPath = go root $ fsTreeFromList root $ map (PF.spl
       leaves <- forM entries $ \entry -> do
         case entry of
           FSFile fname -> do
-            let ie = fromJust $ M.lookup path indexByPath
+            let ie = indexByPath M.! path
                 path' = PF.makeRelative root workdir </> fname
                 path = if "./" `L.isPrefixOf` path' then drop 2 path' else path'
             case indmodeToBlobMode (indMode ie)  of
@@ -267,10 +268,22 @@ printCtx grp@((Both (n1,_) (n2,ln)):_) = (grpcaption ++ hdln):tllns
         (hdln : tllns) = map diffln grp
         grpcaption = printf "@@ -%d,%d +%d,%d @@ " n1 len1 n2 len2
 
+parseConfig dat = reverse $ snd $ L.foldl' iter ("",[]) $ map (words . trim '[' ']' . takeWhile (/= '#')) $ lines dat
+  where trim fc lc str = if head str == fc && last str == lc then (init $ tail str) else str 
+        iter s@(pre, res) [] = s
+        iter (_, res)   [section] = (section, res)
+        iter (pre, res) [section, subsect] = ((section ++ "." ++ trim '"' '"' subsect), res)
+        iter (pre, res) (key:"=":val) = (pre, ((pre ++ "." ++ key, unwords val):res))
+        iter _ ln = error $ "config parsing error at : " ++ unwords ln
+
+lookupConfigs :: String -> [[(String, String)]] -> Maybe String
+lookupConfigs key = listToMaybe . catMaybes . map (L.lookup key)
+
 main = do
   argv <- getArgs
   curdir <- getCurrentDirectory
-  outtty <- hIsTerminalDevice stdout
+  let outtty = True
+  -- outtty <- hIsTerminalDevice stdout
   let colPutStrLn color = if outtty then colorPutStrLn color else putStrLn
 
   -- search for a .git directory:
@@ -283,6 +296,10 @@ main = do
   hasindex <- doesFileExist $ gitdir ++ "/index"
   index <- if hasindex then parseIndex <$> BL.readFile (gitdir ++ "/index") else return []
   let indexByPath = M.fromList $ map (\ie -> (indFName ie, ie)) index
+
+  -- read configs
+  localconf <- parseConfig <$> readFile (gitdir </> "config")
+  userconf <- parseConfig <$> (readFile =<< ((</> ".gitconfig") <$> getHomeDirectory))
 
   -- find pack files and load them
   idxfiles <- filter (L.isSuffixOf ".idx") <$> getDirectoryContents (gitdir </> "objects" </> "pack")
@@ -313,6 +330,8 @@ main = do
 
     ("ls-files":argv') -> mapM_ (putStrLn . indFName) index
 
+    ("config":argv') -> mapM_ (\(k, v) -> putStrLn $ k ++ "=" ++ v) localconf
+
     ("log":[]) -> do
       let printCommit commit = do
               ("commit", _, blob) <- loadBlob gitdir idxmaps (readSHA commit)
@@ -320,8 +339,8 @@ main = do
               let (cmTZ : cmEpoch : cmAuthor) =
                       reverse $ words $ maybeOr "No commit author" $ M.lookup "author" commMeta
               colPutStrLn Yellow $ "commit " ++ commit
-              putStrLn $ "Author:\t" ++ unwords (drop 1 . reverse $ cmAuthor)
-              putStrLn $ "Date\t" ++ show (TOD (read cmEpoch) 0)
+              putStrLn $ "Author:\t" ++ unwords (reverse $ cmAuthor)
+              putStrLn $ "Date:\t" ++ show (TOD (read cmEpoch) 0)
               mapM_ (putStrLn . ("    " ++)) commMsg
               putStrLn ""
               let cmPar = M.lookup "parent" commMeta
@@ -376,21 +395,22 @@ main = do
       (prevcommit, reffile) <- (,) <$> getHeadSHA gitdir <*> getHeadRef gitdir
       prevtree <- getHeadTree gitdir idxmaps
 
-      -- read .git/config or ~/.gitconfig, lookup user.name and user.email
+      treesha <- writeTree gitdir idxmaps =<< makeTreeFromIndex workdir indexByPath
+      when (treesha == readSHA prevtree) $ error "no changes to commit"
+
+      let auth = maybeOr "No user.name configured" $ lookupConfigs "user.name" [localconf, userconf]
+      let mail = maybeOr "No user.email configured" $ lookupConfigs "user.email" [localconf, userconf]
       TOD epoch _ <- getClockTime
-      let cmAuthor = "Dmytro S. <dmytrish@gmail.com> " ++ show epoch ++ " +0300"
+      tzoffset <- timeZoneOffsetString <$> getCurrentTimeZone
+      let cmAuthor = unwords [auth, "<" ++ mail ++ ">", show epoch, tzoffset]
 
-      editor <- maybe "vi" id <$> lookupEnv "EDITOR"
+      editor <- fromMaybe (fromMaybe "vi" $ lookupConfigs "core.editor" [localconf, userconf]) <$> lookupEnv "EDITOR"
       Proc.runCommand (editor ++ " " ++ (gitdir </> "COMMIT_EDITMSG")) >>= Proc.waitForProcess
-
       editmsg <- readFile (gitdir </> "COMMIT_EDITMSG")
       let commMsg = unlines $ filter (not.null) $ map (takeWhile (/= '#')) $ lines editmsg
       when (null commMsg) $ error "no commit message"
 
-      treesha <- writeTree gitdir idxmaps =<< makeTreeFromIndex workdir indexByPath
-      let commMeta = [("tree", showSHA treesha), ("parent", prevcommit), ("author", cmAuthor), ("committer", cmAuthor)]
-      when (treesha == readSHA prevtree) $ fail "no changes to commit"
-
+      let commMeta = [("tree", showSHA treesha),("parent", prevcommit),("author", cmAuthor),("committer", cmAuthor)]
       commit <- showSHA <$> commitTree gitdir commMeta commMsg
       writeFile (gitdir </> "omit_ref") commit
       Dir.renameFile (gitdir </> "omit_ref") (gitdir </> reffile)
