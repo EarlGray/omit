@@ -399,16 +399,16 @@ main = do
       treesha <- writeTree gitdir idxmaps =<< makeTreeFromIndex workdir indexByPath
       when (treesha == readSHA prevtree) $ error "no changes to commit"
 
-      let auth = maybeOr "No user.name configured" $ lookupConfigs "user.name" [localconf, userconf]
-      let mail = maybeOr "No user.email configured" $ lookupConfigs "user.email" [localconf, userconf]
+      let author = maybeOr "No user.name configured" $ lookupConfigs "user.name" [localconf, userconf]
+      let email = maybeOr "No user.email configured" $ lookupConfigs "user.email" [localconf, userconf]
       TOD epoch _ <- getClockTime
       tzoffset <- timeZoneOffsetString <$> getCurrentTimeZone
-      let cmAuthor = unwords [auth, "<" ++ mail ++ ">", show epoch, tzoffset]
+      let cmAuthor = unwords [author, "<" ++ email ++ ">", show epoch, tzoffset]
 
       editor <- fromMaybe (fromMaybe "vi" $ lookupConfigs "core.editor" [localconf, userconf]) <$> lookupEnv "EDITOR"
       Proc.runCommand (editor ++ " " ++ (gitdir </> "COMMIT_EDITMSG")) >>= Proc.waitForProcess
       editmsg <- readFile (gitdir </> "COMMIT_EDITMSG")
-      let commMsg = unlines $ filter (not.null) $ map (takeWhile (/= '#')) $ lines editmsg
+      let commMsg = unlines $ filter (not.null) $ map (dropWhile isSpace . takeWhile (/= '#')) $ lines editmsg
       when (null commMsg) $ error "no commit message"
 
       let commMeta = [("tree", showSHA treesha),("parent", prevcommit),("author", cmAuthor),("committer", cmAuthor)]
