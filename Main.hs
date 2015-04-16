@@ -87,7 +87,10 @@ getHeadTree gitdir idxmaps = do
 blobify :: String -> BL.ByteString -> BL.ByteString
 blobify blobty objdata = BL.append (BLU.fromString (blobty ++ " " ++ show (BL.length objdata) ++ "\0")) objdata
 
-writeObject objpath obj = (createDirectoryIfMissing False $ PF.takeDirectory objpath) >> BL.writeFile objpath (Zlib.compress obj)
+writeObject objpath obj = do
+    createDirectoryIfMissing False $ PF.takeDirectory objpath
+    BL.writeFile objpath (Zlib.compress obj)
+    setFileMode objpath 0o100444
 
 loadBlob :: FilePath -> [PackIndex] -> SHAHash -> IO (String {-type-}, Int {-len-}, BL.ByteString {-blob-})
 loadBlob gitdir idxmaps hash = do
