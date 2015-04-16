@@ -1,6 +1,7 @@
 {-# LANGUAGE TupleSections, ScopedTypeVariables #-}
 import Control.Applicative
 import Control.Monad
+import Control.Arrow as Arr
 import Control.Exception as Exc
 import Data.Maybe
 import Data.Char
@@ -25,6 +26,7 @@ import Data.Time.LocalTime
 import System.Directory as Dir
 import System.Posix as Posix
 import System.FilePath.Posix ((</>))
+import System.FilePath.Glob as Glob
 import qualified System.FilePath.Posix as PF
 import System.Process as Proc
 import System.Environment (getArgs, lookupEnv)
@@ -56,8 +58,8 @@ readSHA = B.pack . map (fst . head . readHex) . splitBy 2
 hashobj :: BL.ByteString -> SHAHash
 hashobj = BL.toStrict . SHA.bytestringDigest . SHA.sha1
 
-type HashInfoMap = M.Map SHAHash (Int, Int, Word32) -- (packOffset, packSize, crc32)
-type PackIndex = (FilePath, HashInfoMap)
+type PackInfoMap = M.Map SHAHash (Int, Int, Word32) -- (packOffset, packSize, crc32)
+type PackInfo = (FilePath, PackInfoMap)
 data IndexEntry = IndexEntry { indCTime::ClockTime, indMTime::ClockTime, indDev::Word32, indIno::Word32,
         indMode::Word32, indUID::Word32, indGID::Word32, indFileSize::Word32, indSHA::SHAHash,
         indFl::Word16, indFName::FilePath } deriving (Show, Eq)
@@ -92,7 +94,7 @@ writeObject objpath obj = do
     BL.writeFile objpath (Zlib.compress obj)
     setFileMode objpath 0o100444
 
-loadBlob :: FilePath -> [PackIndex] -> SHAHash -> IO (String {-type-}, Int {-len-}, BL.ByteString {-blob-})
+loadBlob :: FilePath -> [PackInfo] -> SHAHash -> IO (String {-type-}, Int {-len-}, BL.ByteString {-blob-})
 loadBlob gitdir idxmaps hash = do
     isobj <- doesFileExist (gitdir ++ objpathFor (showSHA hash))
     if isobj then parseBlob <$> Zlib.decompress <$> BL.readFile (gitdir ++ objpathFor (showSHA hash))
@@ -112,7 +114,7 @@ loadBlob gitdir idxmaps hash = do
              let Just blobty = L.lookup (ty .&. 0x70) [(0x10,"commit"), (0x20,"tree"), (0x30,"blob")]
              return (blobty, int $ BL.length blob, blob)
 
-writeBlob :: FilePath -> [(FilePath, HashInfoMap)] -> String -> BL.ByteString -> IO SHAHash
+writeBlob :: FilePath -> [(FilePath, PackInfoMap)] -> String -> BL.ByteString -> IO SHAHash
 writeBlob gitdir idxmaps blobty blob = do
   let obj = blobify blobty blob
   let sha = hashobj obj
@@ -156,7 +158,7 @@ getIdxFile_v2 = do
     -- TODO: 8b offsets
     return $ M.fromAscList $ zip hashv $ zip offv crc32v
 
-parseIdxFile_v2 :: FilePath -> IO HashInfoMap -- (offset, size, crc32)
+parseIdxFile_v2 :: FilePath -> IO PackInfoMap -- (offset, size, crc32)
 parseIdxFile_v2 idxfile = do
     idxdata <- BL.readFile idxfile
     packlen <- int <$> fileSize <$> getFileStatus (PF.replaceExtension idxfile "pack")
@@ -192,7 +194,13 @@ dumpIndex indmap = BL.append body trailer
           mapM_ putWord32be [int cts, int ctns, int mts, int mtns, dev, ino, mod, uid, gid, fsize]
           putByteString sha >> putWord16be fl >> putByteString bname >> replicateM zpadding (putWord8 0)
 
-loadTree :: FilePath -> [(FilePath, HashInfoMap)] -> SHAHash -> FilePath -> IO GitTree
+hashFromGitTree :: [FilePath] -> GitTree -> Maybe SHAHash
+hashFromGitTree [name] (GitTree _ _ entries) = listToMaybe $ mapMaybe match entries
+  where match entry = case entry of { GitBlob _ sha n | n == name -> Just sha; _ -> Nothing }
+hashFromGitTree (dir:dirs) (GitTree _ _ entries) = hashFromGitTree dirs =<< (listToMaybe $ mapMaybe match entries)
+  where match entry = case entry of { GitTree _ d _ | d == dir -> Just entry; _ -> Nothing }
+
+loadTree :: FilePath -> [PackInfo] -> SHAHash -> FilePath -> IO GitTree
 loadTree gitdir pathidx hash dirname = do
   ("tree", _, blob) <- loadBlob gitdir pathidx hash
   let loadSubtree (mod, name, sha) = if mod == "40000" || mod == "040000"
@@ -201,7 +209,9 @@ loadTree gitdir pathidx hash dirname = do
               [("100644",FileBlob), ("100755",ExecBlob), ("120000",SymlinkBlob), ("160000",GitlinkBlob)]) sha name
   GitTree hash dirname <$> forM (parseTreeObject blob) loadSubtree
 
-writeTree :: FilePath -> [PackIndex] -> GitTree -> IO SHAHash
+-- readTree :: GitTree -> IO [IndexEntry]
+
+writeTree :: FilePath -> [PackInfo] -> GitTree -> IO SHAHash
 writeTree _ _ (GitBlob _ sha _) = return sha   -- a blob must have been written by `omit add` already
 writeTree gitdir idxmaps (GitTree sha name entries) = do
   let mkinfo e = case e of { GitBlob mod sha name -> (show mod, name, sha); GitTree sha name _ -> ("40000", name, sha) }
@@ -223,9 +233,23 @@ commitTree gitdir meta msg = do
 
 fsTreeFromList :: FilePath -> [[FilePath]] -> FSTree
 fsTreeFromList dir fileparts = FSDir dir dirlst
-  where grps' = L.groupBy ((==) `on` head) fileparts
-        grps = map (\grp -> (head (head grp), map tail grp)) grps'
-        dirlst = map (\(fname, subdirs) -> if null (head subdirs) then FSFile fname else (fsTreeFromList (PF.dropTrailingPathSeparator fname) subdirs)) grps
+  where grps = map (\grp -> (head (head grp), map tail grp)) $ L.groupBy ((==) `on` head) fileparts
+        sublst fname = fsTreeFromList (PF.dropTrailingPathSeparator fname)
+        dirlst = map (\(fname, subdirs) -> bool (FSFile fname) (sublst fname subdirs) $ null (head subdirs) ) grps
+
+fsTreeFromDir :: FilePath -> FilePath -> [Glob.Pattern] -> IO FSTree
+fsTreeFromDir path dir ignored = FSDir dir <$> catMaybes <$> (mapM fstreefy =<< getDirectoryContents (path </> dir))
+  where fstreefy name = if name `L.elem` [".", "..", ".git"] || L.any (flip Glob.match name) ignored
+          then return Nothing else do
+          st <- getFileStatus (path </> dir </> name)
+          case st of
+            _ | isRegularFile st || isSymbolicLink st -> return $ Just $ FSFile name
+            _ | isDirectory st -> Just <$> fsTreeFromDir (path </> dir) name ignored
+            _ -> return Nothing
+
+fsTreeFlatten :: FilePath -> FSTree -> [FilePath]
+fsTreeFlatten cwd (FSFile fname) = [cwd </> fname]
+fsTreeFlatten cwd (FSDir dname entries) = concat $ map (fsTreeFlatten (cwd </> dname)) entries
 
 makeTreeFromIndex :: FilePath -> M.Map FilePath IndexEntry -> IO GitTree
 makeTreeFromIndex root indexByPath = go root $ fsTreeFromList root $ map (PF.splitPath . indFName . snd) $ M.toAscList indexByPath
@@ -272,7 +296,7 @@ printCtx grp@((Both (n1,_) (n2,ln)):_) = (grpcaption ++ hdln):tllns
         grpcaption = printf "@@ -%d,%d +%d,%d @@ " n1 len1 n2 len2
 
 parseConfig dat = reverse $ snd $ L.foldl' iter ("",[]) $ map (words . trim '[' ']' . takeWhile (/= '#')) $ lines dat
-  where trim fc lc str = if head str == fc && last str == lc then (init $ tail str) else str 
+  where trim fc lc str = if head str == fc && last str == lc then (init $ tail str) else str
         iter s@(pre, res) [] = s
         iter (_, res)   [section] = (section, res)
         iter (pre, res) [section, subsect] = ((section ++ "." ++ trim '"' '"' subsect), res)
@@ -307,6 +331,10 @@ main = do
   idxfiles <- filter (L.isSuffixOf ".idx") <$> getDirectoryContents (gitdir </> "objects" </> "pack")
   idxmaps <- zip idxfiles <$> forM idxfiles (parseIdxFile_v2 . ((gitdir ++ "/objects/pack/") ++))
 
+  -- .gitignore
+  let gitignpath = (workdir </> ".gitignore")
+  gitignore <- (bool (map Glob.compile <$> lines <$> readFile gitignpath) (return [])) =<< (doesFileExist gitignpath)
+
   let lc = 7  -- longest collision, TODO
 
   case argv of
@@ -331,6 +359,41 @@ main = do
       verifyPack `Exc.catch` (\(e :: Exc.SomeException) -> when verbose (hPrint stderr e) >> exitFailure)
 
     ("ls-files":argv') -> mapM_ (putStrLn . indFName) index
+
+    ["status"] -> do
+      workfiles <- S.fromList <$> fsTreeFlatten "" <$> fsTreeFromDir workdir "" gitignore
+      headTreeSHA <- getHeadTree gitdir idxmaps
+      headtree <- loadTree gitdir idxmaps (readSHA headTreeSHA) ""
+      let indfiles = map indFName index
+          untracked = workfiles `S.difference` (S.fromList indfiles)
+
+      let isFileStaged ie fname = do
+              st <- getFileStatus (workdir </> fname)
+              let ctime = todFromPosix $ statusChangeTimeHiRes st
+                  mtime = todFromPosix $ modificationTimeHiRes st
+              return (ctime == indCTime ie && mtime == indMTime ie)
+      let sortTracked (new, modified, staged, deleted) fname = do
+            exists <- doesFileExist (workdir </> fname)
+            if not exists then return (new, modified, staged, fname:deleted)  -- deleted
+            else do
+              case hashFromGitTree (PF.splitDirectories fname) headtree of
+                Nothing -> return (fname:new, modified, staged, deleted) -- new
+                Just headsha -> do
+                  inindex <- isFileStaged (indexByPath M.! fname) fname
+                  if inindex then
+                    if (indSHA (indexByPath M.! fname) /= headsha)
+                    then return (new, modified, fname:staged, deleted) -- staged
+                    else return (new, modified, staged, deleted)     -- already committed
+                  else return (new, fname:modified, staged, deleted) -- modified
+
+      (new, modified, staged, deleted) <- foldM sortTracked ([], [], [], []) indfiles
+
+      let printFList col = mapM_ (colPutStrLn col . ('\t':))
+      unless (L.null new) $ putStrLn "New files to be commited:" >> printFList Green new
+      unless (L.null staged) $ putStrLn "Changes to be committed:" >> printFList Green staged
+      unless (L.null modified) $ putStrLn "Changes not staged for commit:" >> printFList Red modified
+      unless (L.null deleted) $ putStrLn "Deleted files:" >> printFList Red deleted
+      unless (S.null untracked) $ putStrLn "Untracked files:" >> printFList Red (S.toAscList untracked)
 
     ("config":argv') -> mapM_ (\(k, v) -> putStrLn $ k ++ "=" ++ v) localconf
 
@@ -395,6 +458,11 @@ main = do
       treesha <- writeTree gitdir idxmaps =<< makeTreeFromIndex workdir indexByPath
       putStrLn $ showSHA treesha
 
+    ("checkout":argv') -> do
+      let (opts, paths) = Arr.second (dropWhile (== "--")) $ L.break (== "--") argv'
+      if L.null paths then error "TODO: checkout <branch> not implemented"
+      else error "TODO: checkout -- <paths> not implemneted yet"
+
     ("commit":argv') -> do
       (prevcommit, reffile) <- (,) <$> getHeadSHA gitdir <*> getHeadRef gitdir
       prevtree <- getHeadTree gitdir idxmaps
@@ -402,17 +470,17 @@ main = do
       treesha <- writeTree gitdir idxmaps =<< makeTreeFromIndex workdir indexByPath
       when (treesha == readSHA prevtree) $ error "no changes to commit"
 
-      let author = maybeOr "No user.name configured" $ lookupConfigs "user.name" [localconf, userconf]
-      let email = maybeOr "No user.email configured" $ lookupConfigs "user.email" [localconf, userconf]
-      TOD epoch _ <- getClockTime
-      tzoffset <- timeZoneOffsetString <$> getCurrentTimeZone
-      let cmAuthor = unwords [author, "<" ++ email ++ ">", show epoch, tzoffset]
-
       editor <- fromMaybe (fromMaybe "vi" $ lookupConfigs "core.editor" [localconf, userconf]) <$> lookupEnv "EDITOR"
       Proc.runCommand (editor ++ " " ++ (gitdir </> "COMMIT_EDITMSG")) >>= Proc.waitForProcess
       editmsg <- readFile (gitdir </> "COMMIT_EDITMSG")
       let commMsg = unlines $ filter (not.null) $ map (dropWhile isSpace . takeWhile (/= '#')) $ lines editmsg
       when (null commMsg) $ error "no commit message"
+
+      let author = maybeOr "No user.name configured" $ lookupConfigs "user.name" [localconf, userconf]
+      let email = maybeOr "No user.email configured" $ lookupConfigs "user.email" [localconf, userconf]
+      TOD epoch _ <- getClockTime
+      tzoffset <- timeZoneOffsetString <$> getCurrentTimeZone
+      let cmAuthor = unwords [author, "<" ++ email ++ ">", show epoch, tzoffset]
 
       let commMeta = [("tree", showSHA treesha),("parent", prevcommit),("author", cmAuthor),("committer", cmAuthor)]
       commit <- showSHA <$> commitTree gitdir commMeta commMsg
