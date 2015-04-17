@@ -111,7 +111,7 @@ loadBlob gitdir idxmaps hash = do
              let Just (blobpos, blobsz, _) = M.lookup hash idxmap
              (ty, zblob) <- runGet (getblob blobpos blobsz) <$> BL.readFile packfile
              let blob = Zlib.decompress zblob
-             let Just blobty = L.lookup (ty .&. 0x70) [(0x10,"commit"), (0x20,"tree"), (0x30,"blob")]
+             let Just blobty = L.lookup (ty .&. 0x70) [(0x10,"commit"), (0x20,"tree"), (0x30,"blob"), (0x40,"tag"), (0x60,"ofsdel"), (0x70, "refdel")]
              return (blobty, int $ BL.length blob, blob)
 
 writeBlob :: FilePath -> [(FilePath, PackInfoMap)] -> String -> BL.ByteString -> IO SHAHash
@@ -136,8 +136,9 @@ parseTreeObject = L.unfoldr parseEntry . BL.unpack -- [(mode::String, name::File
             in Just ((BU.toString $ B.pack mode, BU.toString $ B.pack path, B.pack hsh), tl')
 
 dumpTreeObject :: [(String, FilePath, SHAHash)] -> BL.ByteString
-dumpTreeObject = runPut . void . mapM dumpTreeEntry . L.sortBy (compare `on` (\(_,e,_) -> BU.fromString e))
-  where dumpTreeEntry (mod, name, sha) = putByteString (BU.fromString $ mod ++ " " ++ name) >> putWord8 0 >> putByteString sha
+dumpTreeObject = runPut . void . mapM dumpTreeEntry . L.sortBy comparator
+  where comparator = compare `on` (\(m,e,_) -> BU.fromString $ e ++ (bool "/" "" (m == "40000")))
+        dumpTreeEntry (mod, name, sha) = putByteString (BU.fromString $ mod ++ " " ++ name) >> putWord8 0 >> putByteString sha
 
 prettyTreeObject :: [(String, FilePath, SHAHash)] -> String
 prettyTreeObject = unlines . map (\(mode, path, hash) -> concat [ty mode, " ", showSHA hash, "    ", path])
