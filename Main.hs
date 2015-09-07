@@ -304,6 +304,8 @@ parseConfig dat = reverse $ snd $ L.foldl' iter ("",[]) $ map (words . trim '[' 
         iter (pre, res) (key:"=":val) = (pre, ((pre ++ "." ++ key, unwords val):res))
         iter _ ln = error $ "config parsing error at : " ++ unwords ln
 
+readConfig path = doesFileExist path >>= bool (parseConfig <$> readFile path) (return [])
+
 lookupConfigs :: String -> [[(String, String)]] -> Maybe String
 lookupConfigs key = listToMaybe . catMaybes . map (L.lookup key)
 
@@ -325,8 +327,8 @@ main = do
   let indexByPath = M.fromList $ map (\ie -> (indFName ie, ie)) index
 
   -- read configs
-  localconf <- parseConfig <$> readFile (gitdir </> "config")
-  userconf <- parseConfig <$> (readFile =<< ((</> ".gitconfig") <$> getHomeDirectory))
+  localconf <- readConfig (gitdir </> "config")
+  userconf <- readConfig =<< ((</> ".gitconfig") <$> getHomeDirectory)
 
   -- find pack files and load them
   idxfiles <- filter (L.isSuffixOf ".idx") <$> getDirectoryContents (gitdir </> "objects" </> "pack")
