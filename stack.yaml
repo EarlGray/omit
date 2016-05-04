@@ -1,0 +1,11 @@
+resolver: lts-5.15
+packages:
+- '.'
+extra-deps: []
+flags: {}
+extra-package-dbs: []
+
+# arch: x86_64
+
+# extra-include-dirs: [/path/to/dir]
+# extra-lib-dirs: [/path/to/dir]
