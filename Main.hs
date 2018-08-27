@@ -244,7 +244,7 @@ fsTreeFromDir path dir ignored = FSDir dir <$> catMaybes <$> (mapM fstreefy =<< 
           then return Nothing else do
           st <- getFileStatus (path </> dir </> name)
           case st of
-            _ | isRegularFile st || isSymbolicLink st -> return $ Just $ FSFile name
+            _ | isRegularFile st || Posix.isSymbolicLink st -> return $ Just $ FSFile name
             _ | isDirectory st -> Just <$> fsTreeFromDir (path </> dir) name ignored
             _ -> return Nothing
 
@@ -442,7 +442,7 @@ main = do
             s <- getFileStatus path
             (blob, mod) <- case s of
               _ | isRegularFile s  -> (, bool 0o100755 0o100644 (fileMode s `testBit` 6)) <$> BL.readFile path
-              _ | isSymbolicLink s -> (, 0o120000) <$> BLU.fromString <$> Posix.readSymbolicLink path
+              _ | Posix.isSymbolicLink s -> (, 0o120000) <$> BLU.fromString <$> Posix.readSymbolicLink path
               _ -> error ("not a valid file to add: " ++ rpath)
             sha <- writeBlob gitdir idxmaps "blob" blob
             let fname = PF.makeRelative workdir path
